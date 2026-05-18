@@ -21,7 +21,7 @@ brew install im-select
 # https://github.com/daipeihust/im-select
 ```
 
-确保 `im-select` 位于 `~/.local/bin/im-select`，或在源码中修改 `IM_SELECT` 常量指向正确路径。
+确保 `im-select` 在 `PATH` 中可找到，或通过插件配置指定路径（见下方配置节）。
 
 ## 编译
 
@@ -50,6 +50,24 @@ plugins {
     ime-per-pane location="file:~/.config/zellij/plugins/zellij_ime_per_pane.wasm"
 }
 ```
+
+### 自定义配置
+
+在 `config.kdl` 中可以通过 `_configuration` 传参：
+
+```kdl
+plugins {
+    ime-per-pane location="file:~/.config/zellij/plugins/zellij_ime_per_pane.wasm" {
+        im_select "/opt/homebrew/bin/im-select"
+        state_dir "~/.cache/zellij-ime"
+    }
+}
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `im_select` | `~/.local/bin/im-select` | im-select 可执行文件路径 |
+| `state_dir` | `~/.cache/zellij-ime` | 输入法状态存储目录 |
 
 ## 工作原理
 

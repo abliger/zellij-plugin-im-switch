@@ -1,67 +1,71 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use zellij_tile::prelude::*;
 
-const IM_SELECT: &str = "/Users/lvming/.local/bin/im-select";
-const STATE_DIR: &str = "/Users/lvming/.cache/zellij-ime";
-const LOG_FILE: &str = "/Users/lvming/.cache/zellij-ime/debug.log";
+const VERSION: &str = "0.1.0";
 
 #[derive(Default)]
 struct State {
     active_tab: Option<usize>,
     focused_pane: Option<PaneId>,
+    im_select: String,
+    state_dir: String,
 }
 
-fn log(msg: &str) {
-    let script = format!("mkdir -p '{STATE_DIR}' && echo \"[$(date +%H:%M:%S)] {msg}\" >> '{LOG_FILE}'");
-    let mut ctx = BTreeMap::new();
-    ctx.insert("from_log".to_string(), "1".to_string());
-    run_command(&["sh", "-c", &script], ctx);
+impl State {
+    fn log(&self, msg: &str) {
+        let log_path = format!("{}/debug.log", self.state_dir);
+        let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let _ = writeln!(file, "{}", msg);
+    }
 }
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _config: BTreeMap<String, String>) {
+    fn load(&mut self, config: BTreeMap<String, String>) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+
+        self.im_select = config
+            .get("im_select")
+            .cloned()
+            .unwrap_or_else(|| format!("{}/.local/bin/im-select", home));
+        self.state_dir = config
+            .get("state_dir")
+            .cloned()
+            .unwrap_or_else(|| format!("{}/.cache/zellij-ime", home));
+
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
         ]);
-        subscribe(&[EventType::TabUpdate, EventType::PaneUpdate, EventType::RunCommandResult]);
-        log("plugin loaded");
+        subscribe(&[
+            EventType::TabUpdate,
+            EventType::PaneUpdate,
+            EventType::RunCommandResult,
+        ]);
+        self.log("plugin loaded");
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::PermissionRequestResult(permission_status) => {
-                match permission_status {
-                    PermissionStatus::Granted => {
-                        log("permissions granted");
-                    }
-                    PermissionStatus::Denied => {
-                        log("permissions DENIED");
-                    }
-                }
-            }
+            Event::PermissionRequestResult(_) => {}
             Event::TabUpdate(tabs) => {
-                log(&format!("TabUpdate: {} tabs", tabs.len()));
                 if let Some(t) = tabs.iter().find(|t| t.active) {
                     self.active_tab = Some(t.position);
-                    log(&format!("  active_tab={}", t.position));
                 }
             }
             Event::PaneUpdate(manifest) => {
                 let tab = match self.active_tab {
                     Some(t) => t,
-                    None => {
-                        log("PaneUpdate: active_tab is None, skipping");
-                        return false;
-                    }
+                    None => return false,
                 };
                 let panes = match manifest.panes.get(&tab) {
                     Some(p) => p,
-                    None => {
-                        log(&format!("PaneUpdate: no panes for tab {tab}"));
-                        return false;
-                    }
+                    None => return false,
                 };
 
                 let p = panes
@@ -71,13 +75,7 @@ impl ZellijPlugin for State {
 
                 let p = match p {
                     Some(p) => p,
-                    None => {
-                        log(&format!(
-                            "PaneUpdate: no focused non-plugin pane in tab {tab}, panes={}",
-                            panes.len()
-                        ));
-                        return false;
-                    }
+                    None => return false,
                 };
 
                 let new_id = pane_id(p);
@@ -86,45 +84,49 @@ impl ZellijPlugin for State {
                 }
                 let old_id = self.focused_pane;
                 self.focused_pane = Some(new_id);
-                log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
+                self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
 
-                let script = match old_id {
-                    Some(old) => format!(
-                        "mkdir -p {dir}; \
-                         OLD=$({im}); \
-                         printf '%s' \"$OLD\" > {dir}/{old}.ime; \
-                         if [ -f {dir}/{new}.ime ]; then \
-                             NEW=$(cat {dir}/{new}.ime); \
-                             [ \"$OLD\" != \"$NEW\" ] && {im} \"$NEW\"; \
-                         fi",
-                        im = IM_SELECT,
-                        dir = STATE_DIR,
-                        old = old_file_name(&old),
-                        new = new_file_name(&new_id)
-                    ),
-                    None => format!(
-                        "mkdir -p {dir}; \
-                         if [ -f {dir}/{new}.ime ]; then \
-                             {im} \"$(cat {dir}/{new}.ime)\"; \
-                         fi",
-                        im = IM_SELECT,
-                        dir = STATE_DIR,
-                        new = new_file_name(&new_id)
-                    ),
-                };
-                run_command(&["sh", "-c", &script], BTreeMap::new());
-            }
-            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                if context.get("from_log").is_some() {
-                    return false;
+                let mut ctx = BTreeMap::new();
+                ctx.insert("im_switch".to_string(), "1".to_string());
+
+                match old_id {
+                    Some(old) => {
+                        let script = format!(
+                            "mkdir -p '{dir}'; \
+                             OLD=$({im}); \
+                             printf '%s' \"$OLD\" > '{dir}/'\"$1\".ime; \
+                             if [ -f '{dir}/'\"$2\".ime ]; then \
+                                 NEW=$(cat '{dir}/'\"$2\".ime); \
+                                 [ \"$OLD\" != \"$NEW\" ] && {im} \"$NEW\"; \
+                             fi",
+                            im = self.im_select,
+                            dir = self.state_dir,
+                        );
+                        run_command(
+                            &["sh", "-c", &script, "--", &file_name(&old), &file_name(&new_id)],
+                            ctx,
+                        );
+                    }
+                    None => {
+                        let script = format!(
+                            "mkdir -p '{dir}'; \
+                             if [ -f '{dir}/'\"$1\".ime ]; then \
+                                 {im} \"$(cat '{dir}/'\"$1\".ime)\"; \
+                             fi",
+                            im = self.im_select,
+                            dir = self.state_dir,
+                        );
+                        run_command(
+                            &["sh", "-c", &script, "--", &file_name(&new_id)],
+                            ctx,
+                        );
+                    }
                 }
-                log(&format!(
-                    "RunCommandResult: exit={:?} ctx={:?} stdout={} stderr={}",
-                    exit_code,
-                    context,
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                ));
+            }
+            Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
+                if context.get("im_switch").is_some() && exit_code != Some(0) {
+                    self.log("im-select command failed");
+                }
             }
             _ => {}
         }
@@ -140,14 +142,7 @@ fn pane_id(p: &PaneInfo) -> PaneId {
     }
 }
 
-fn old_file_name(id: &PaneId) -> String {
-    match id {
-        PaneId::Terminal(n) => format!("t{}", n),
-        PaneId::Plugin(n) => format!("p{}", n),
-    }
-}
-
-fn new_file_name(id: &PaneId) -> String {
+fn file_name(id: &PaneId) -> String {
     match id {
         PaneId::Terminal(n) => format!("t{}", n),
         PaneId::Plugin(n) => format!("p{}", n),
@@ -170,44 +165,64 @@ pub fn __main_void() -> i32 {
 pub fn load() {
     STATE.with(|state| {
         use std::convert::TryFrom;
-        use std::convert::TryInto;
         use zellij_tile::shim::plugin_api::action::ProtobufPluginConfiguration;
         use zellij_tile::shim::prost::Message;
-        let protobuf_bytes: Vec<u8> = zellij_tile::shim::object_from_stdin().unwrap();
-        let protobuf_configuration: ProtobufPluginConfiguration =
-            ProtobufPluginConfiguration::decode(protobuf_bytes.as_slice()).unwrap();
-        let plugin_configuration: BTreeMap<String, String> =
-            BTreeMap::try_from(&protobuf_configuration).unwrap();
+
+        let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            return;
+        };
+        let Ok(protobuf_configuration) =
+            ProtobufPluginConfiguration::decode(protobuf_bytes.as_slice())
+        else {
+            return;
+        };
+        let Ok(plugin_configuration) = BTreeMap::try_from(&protobuf_configuration) else {
+            return;
+        };
         state.borrow_mut().load(plugin_configuration);
     });
 }
 
 #[no_mangle]
 pub fn update() -> bool {
-    use std::convert::TryInto;
-    use zellij_tile::shim::plugin_api::event::ProtobufEvent;
-    use zellij_tile::shim::prost::Message;
     STATE.with(|state| {
-        let protobuf_bytes: Vec<u8> = zellij_tile::shim::object_from_stdin().unwrap();
-        let protobuf_event: ProtobufEvent =
-            ProtobufEvent::decode(protobuf_bytes.as_slice()).unwrap();
-        let event = protobuf_event.try_into().unwrap();
+        use std::convert::TryInto;
+        use zellij_tile::shim::plugin_api::event::ProtobufEvent;
+        use zellij_tile::shim::prost::Message;
+
+        let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            return false;
+        };
+        let Ok(protobuf_event) = ProtobufEvent::decode(protobuf_bytes.as_slice()) else {
+            return false;
+        };
+        let Ok(event) = protobuf_event.try_into() else {
+            return false;
+        };
         state.borrow_mut().update(event)
     })
 }
 
 #[no_mangle]
 pub fn pipe() -> bool {
-    use std::convert::TryInto;
-    use zellij_tile::shim::plugin_api::pipe_message::ProtobufPipeMessage;
-    use zellij_tile::shim::prost::Message;
     STATE.with(|state| {
-        let protobuf_bytes: Vec<u8> = zellij_tile::shim::object_from_stdin().unwrap();
-        let protobuf_pipe_message: ProtobufPipeMessage =
-            ProtobufPipeMessage::decode(protobuf_bytes.as_slice()).unwrap();
-        let pipe_message = protobuf_pipe_message.try_into().unwrap();
+        use std::convert::TryInto;
+        use zellij_tile::shim::plugin_api::pipe_message::ProtobufPipeMessage;
+        use zellij_tile::shim::prost::Message;
+
+        let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            return false;
+        };
+        let Ok(protobuf_pipe_message) = ProtobufPipeMessage::decode(protobuf_bytes.as_slice())
+        else {
+            return false;
+        };
+        let Ok(pipe_message) = protobuf_pipe_message.try_into() else {
+            return false;
+        };
         state.borrow_mut().pipe(pipe_message)
-    })
+    });
+    false
 }
 
 #[no_mangle]
@@ -219,5 +234,5 @@ pub fn render(rows: i32, cols: i32) {
 
 #[no_mangle]
 pub fn plugin_version() {
-    println!("{}", zellij_tile::prelude::VERSION);
+    println!("{}", VERSION);
 }
