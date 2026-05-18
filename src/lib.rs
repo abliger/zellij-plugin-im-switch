@@ -14,14 +14,56 @@ struct State {
     state_dir: String,
 }
 
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    path.to_string()
+}
+
+fn clear_old_state(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("ime") {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("clear_old_state: failed to remove {:?}: {}", path, e);
+            }
+        }
+    }
+}
+
 impl State {
     fn log(&self, msg: &str) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let log_path = format!("{}/debug.log", self.state_dir);
         let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("log: failed to open {}: {}", log_path, e);
+                return;
+            }
         };
-        let _ = writeln!(file, "{}", msg);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        let ts = format!(
+            "{:02}:{:02}:{:02}",
+            (secs / 3600) % 24,
+            (secs / 60) % 60,
+            secs % 60
+        );
+
+        if let Err(e) = writeln!(file, "[{}] {}", ts, msg) {
+            eprintln!("log: failed to write: {}", e);
+        }
     }
 }
 
@@ -29,14 +71,23 @@ impl ZellijPlugin for State {
     fn load(&mut self, config: BTreeMap<String, String>) {
         let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
 
-        self.im_select = config
-            .get("im_select")
-            .cloned()
-            .unwrap_or_else(|| format!("{}/.local/bin/im-select", home));
-        self.state_dir = config
-            .get("state_dir")
-            .cloned()
-            .unwrap_or_else(|| format!("{}/.cache/zellij-ime", home));
+        self.im_select = expand_tilde(
+            &config
+                .get("im_select")
+                .cloned()
+                .unwrap_or_else(|| format!("{}/.local/bin/im-select", home)),
+        );
+        self.state_dir = expand_tilde(
+            &config
+                .get("state_dir")
+                .cloned()
+                .unwrap_or_else(|| format!("{}/.cache/zellij-ime", home)),
+        );
+
+        if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
+            eprintln!("load: failed to create state dir {}: {}", self.state_dir, e);
+        }
+        clear_old_state(&self.state_dir);
 
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -59,6 +110,14 @@ impl ZellijPlugin for State {
                 }
             }
             Event::PaneUpdate(manifest) => {
+                if self.active_tab.is_none() {
+                    for (tab_pos, panes) in &manifest.panes {
+                        if panes.iter().any(|p| p.is_focused) {
+                            self.active_tab = Some(*tab_pos);
+                            break;
+                        }
+                    }
+                }
                 let tab = match self.active_tab {
                     Some(t) => t,
                     None => return false,
@@ -124,7 +183,7 @@ impl ZellijPlugin for State {
                 }
             }
             Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
-                if context.get("im_switch").is_some() && exit_code != Some(0) {
+                if context.contains_key("im_switch") && exit_code != Some(0) {
                     self.log("im-select command failed");
                 }
             }
@@ -135,11 +194,8 @@ impl ZellijPlugin for State {
 }
 
 fn pane_id(p: &PaneInfo) -> PaneId {
-    if p.is_plugin {
-        PaneId::Plugin(p.id)
-    } else {
-        PaneId::Terminal(p.id)
-    }
+    debug_assert!(!p.is_plugin);
+    PaneId::Terminal(p.id)
 }
 
 fn file_name(id: &PaneId) -> String {
@@ -169,14 +225,17 @@ pub fn load() {
         use zellij_tile::shim::prost::Message;
 
         let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            eprintln!("load: failed to read stdin");
             return;
         };
         let Ok(protobuf_configuration) =
             ProtobufPluginConfiguration::decode(protobuf_bytes.as_slice())
         else {
+            eprintln!("load: failed to decode protobuf");
             return;
         };
         let Ok(plugin_configuration) = BTreeMap::try_from(&protobuf_configuration) else {
+            eprintln!("load: failed to convert configuration");
             return;
         };
         state.borrow_mut().load(plugin_configuration);
@@ -191,12 +250,15 @@ pub fn update() -> bool {
         use zellij_tile::shim::prost::Message;
 
         let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            eprintln!("update: failed to read stdin");
             return false;
         };
         let Ok(protobuf_event) = ProtobufEvent::decode(protobuf_bytes.as_slice()) else {
+            eprintln!("update: failed to decode protobuf");
             return false;
         };
         let Ok(event) = protobuf_event.try_into() else {
+            eprintln!("update: failed to convert event");
             return false;
         };
         state.borrow_mut().update(event)
@@ -211,18 +273,20 @@ pub fn pipe() -> bool {
         use zellij_tile::shim::prost::Message;
 
         let Ok(protobuf_bytes) = zellij_tile::shim::object_from_stdin::<Vec<u8>>() else {
+            eprintln!("pipe: failed to read stdin");
             return false;
         };
         let Ok(protobuf_pipe_message) = ProtobufPipeMessage::decode(protobuf_bytes.as_slice())
         else {
+            eprintln!("pipe: failed to decode protobuf");
             return false;
         };
         let Ok(pipe_message) = protobuf_pipe_message.try_into() else {
+            eprintln!("pipe: failed to convert pipe message");
             return false;
         };
         state.borrow_mut().pipe(pipe_message)
-    });
-    false
+    })
 }
 
 #[no_mangle]
