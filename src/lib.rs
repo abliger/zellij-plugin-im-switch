@@ -65,6 +65,72 @@ impl State {
             eprintln!("log: failed to write: {}", e);
         }
     }
+
+    fn resolve_tab_from_manifest(&mut self, manifest: &PaneManifest) {
+        if self.active_tab.is_some() {
+            return;
+        }
+        for (tab_pos, panes) in &manifest.panes {
+            if panes.iter().any(|p| p.is_focused) {
+                self.active_tab = Some(*tab_pos);
+                break;
+            }
+        }
+    }
+
+    fn focused_pane_id(&self, manifest: &PaneManifest) -> Option<PaneId> {
+        let tab = self.active_tab?;
+        let panes = manifest.panes.get(&tab)?;
+
+        let p = panes
+            .iter()
+            .find(|p| p.is_focused && !p.is_plugin && p.is_floating)
+            .or_else(|| panes.iter().find(|p| p.is_focused && !p.is_plugin))?;
+
+        debug_assert!(!p.is_plugin);
+        Some(PaneId::Terminal(p.id))
+    }
+
+    fn switch_ime(&self, old_id: Option<PaneId>, new_id: PaneId) {
+        self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
+
+        let mut ctx = BTreeMap::new();
+        ctx.insert("im_switch".to_string(), "1".to_string());
+
+        match old_id {
+            Some(old) => {
+                let script = format!(
+                    "mkdir -p '{dir}'; \
+                     OLD=$({im}); \
+                     printf '%s' \"$OLD\" > '{dir}/'\"$1\".ime; \
+                     if [ -f '{dir}/'\"$2\".ime ]; then \
+                         NEW=$(cat '{dir}/'\"$2\".ime); \
+                         [ \"$OLD\" != \"$NEW\" ] && {im} \"$NEW\"; \
+                     fi",
+                    im = self.im_select,
+                    dir = self.state_dir,
+                );
+                run_command(
+                    &["sh", "-c", &script, "--", &file_name(&old), &file_name(&new_id)],
+                    ctx,
+                );
+            }
+            None => {
+                let script = format!(
+                    "mkdir -p '{dir}'; \
+                     if [ -f '{dir}/'\"$1\".ime ]; then \
+                         {im} \"$(cat '{dir}/'\"$1\".ime)\"; \
+                     fi",
+                    im = self.im_select,
+                    dir = self.state_dir,
+                );
+                run_command(
+                    &["sh", "-c", &script, "--", &file_name(&new_id)],
+                    ctx,
+                );
+            }
+        }
+    }
 }
 
 impl ZellijPlugin for State {
@@ -110,77 +176,17 @@ impl ZellijPlugin for State {
                 }
             }
             Event::PaneUpdate(manifest) => {
-                if self.active_tab.is_none() {
-                    for (tab_pos, panes) in &manifest.panes {
-                        if panes.iter().any(|p| p.is_focused) {
-                            self.active_tab = Some(*tab_pos);
-                            break;
-                        }
-                    }
-                }
-                let tab = match self.active_tab {
-                    Some(t) => t,
+                self.resolve_tab_from_manifest(&manifest);
+                let new_id = match self.focused_pane_id(&manifest) {
+                    Some(id) => id,
                     None => return false,
                 };
-                let panes = match manifest.panes.get(&tab) {
-                    Some(p) => p,
-                    None => return false,
-                };
-
-                let p = panes
-                    .iter()
-                    .find(|p| p.is_focused && !p.is_plugin && p.is_floating)
-                    .or_else(|| panes.iter().find(|p| p.is_focused && !p.is_plugin));
-
-                let p = match p {
-                    Some(p) => p,
-                    None => return false,
-                };
-
-                let new_id = pane_id(p);
                 if self.focused_pane == Some(new_id) {
                     return false;
                 }
                 let old_id = self.focused_pane;
                 self.focused_pane = Some(new_id);
-                self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
-
-                let mut ctx = BTreeMap::new();
-                ctx.insert("im_switch".to_string(), "1".to_string());
-
-                match old_id {
-                    Some(old) => {
-                        let script = format!(
-                            "mkdir -p '{dir}'; \
-                             OLD=$({im}); \
-                             printf '%s' \"$OLD\" > '{dir}/'\"$1\".ime; \
-                             if [ -f '{dir}/'\"$2\".ime ]; then \
-                                 NEW=$(cat '{dir}/'\"$2\".ime); \
-                                 [ \"$OLD\" != \"$NEW\" ] && {im} \"$NEW\"; \
-                             fi",
-                            im = self.im_select,
-                            dir = self.state_dir,
-                        );
-                        run_command(
-                            &["sh", "-c", &script, "--", &file_name(&old), &file_name(&new_id)],
-                            ctx,
-                        );
-                    }
-                    None => {
-                        let script = format!(
-                            "mkdir -p '{dir}'; \
-                             if [ -f '{dir}/'\"$1\".ime ]; then \
-                                 {im} \"$(cat '{dir}/'\"$1\".ime)\"; \
-                             fi",
-                            im = self.im_select,
-                            dir = self.state_dir,
-                        );
-                        run_command(
-                            &["sh", "-c", &script, "--", &file_name(&new_id)],
-                            ctx,
-                        );
-                    }
-                }
+                self.switch_ime(old_id, new_id);
             }
             Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
                 if context.contains_key("im_switch") && exit_code != Some(0) {
@@ -191,11 +197,6 @@ impl ZellijPlugin for State {
         }
         false
     }
-}
-
-fn pane_id(p: &PaneInfo) -> PaneId {
-    debug_assert!(!p.is_plugin);
-    PaneId::Terminal(p.id)
 }
 
 fn file_name(id: &PaneId) -> String {
