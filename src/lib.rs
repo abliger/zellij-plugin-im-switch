@@ -13,8 +13,10 @@ struct State {
 }
 
 fn log(msg: &str) {
-    let script = format!("mkdir -p '{STATE_DIR}' && echo '[$(date +%H:%M:%S)] {msg}' >> '{LOG_FILE}'");
-    run_command(&["sh", "-c", &script], BTreeMap::new());
+    let script = format!("mkdir -p '{STATE_DIR}' && echo \"[$(date +%H:%M:%S)] {msg}\" >> '{LOG_FILE}'");
+    let mut ctx = BTreeMap::new();
+    ctx.insert("from_log".to_string(), "1".to_string());
+    run_command(&["sh", "-c", &script], ctx);
 }
 
 impl ZellijPlugin for State {
@@ -113,8 +115,16 @@ impl ZellijPlugin for State {
                 run_command(&["sh", "-c", &script], BTreeMap::new());
             }
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                log(&format!("RunCommandResult: exit={:?} ctx={:?} stdout={} stderr={}",
-                    exit_code, context, String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr)));
+                if context.get("from_log").is_some() {
+                    return false;
+                }
+                log(&format!(
+                    "RunCommandResult: exit={:?} ctx={:?} stdout={} stderr={}",
+                    exit_code,
+                    context,
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ));
             }
             _ => {}
         }
