@@ -2,14 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - .cargo/**
-      - src/**
-      - Cargo.lock
-      - Cargo.toml
-      - .github/workflows/release.yml
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -24,11 +18,9 @@ jobs:
       - name: Get app version
         id: version
         run: |
-          APP_VERSION=$(git rev-parse --short HEAD)
-          CURRENT_DATE=$(date +'%Y.%m.%d')
-          APP_VERSION_DATE="${CURRENT_DATE}-${APP_VERSION}"
-          echo "version=$APP_VERSION_DATE"
-          echo "version=$APP_VERSION_DATE" >> "$GITHUB_OUTPUT"
+          TAG_NAME="${GITHUB_REF_NAME}"
+          echo "version=$TAG_NAME"
+          echo "version=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
