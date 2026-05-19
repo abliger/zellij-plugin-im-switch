@@ -28,6 +28,34 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace("'", "'\\''"))
 }
 
+fn epoch_to_ymd(secs: u64) -> (u64, u64, u64) {
+    let mut days = secs / 86_400;
+    let mut year = 1970u64;
+    loop {
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let d = if leap { 366 } else { 365 };
+        if days < d {
+            break;
+        }
+        days -= d;
+        year += 1;
+    }
+    static MONTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let mut month = 1u64;
+    for &dim in &MONTHS[..11] {
+        let d = if month == 2 && leap { 29 } else { dim };
+        if days < d {
+            break;
+        }
+        days -= d;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
 fn clear_old_state(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -59,8 +87,12 @@ impl State {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let secs = now.as_secs();
+        let (y, m, d) = epoch_to_ymd(secs);
         let ts = format!(
-            "{:02}:{:02}:{:02}",
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            y,
+            m,
+            d,
             (secs / 3600) % 24,
             (secs / 60) % 60,
             secs % 60

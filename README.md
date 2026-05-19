@@ -75,7 +75,7 @@ plugins {
 2. 当焦点切换到新 pane 时：
    - 保存当前 pane 的输入法状态到 `~/.cache/zellij-ime/{pane_id}.ime`
    - 如果目标 pane 有保存的状态，则恢复该输入法
-3. 状态按 pane ID 持久化，重启 Zellij 后仍然有效
+3. 状态按 pane ID 持久化（Zellij 重启后 pane ID 会重新分配，旧状态会被清除）
 
 ## 文件
 
