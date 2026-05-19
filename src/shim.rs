@@ -7,8 +7,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
-// Zellij 以裸函数形式调用入口点，不会传入 State 实例。
-// 我们将单例存放在 thread_local 中，每个钩子都从这里访问。
+// Zellij 调用插件时，直接调用 load()、update() 这类函数，
+// 这些函数没有 self 参数，也没有 State 实例传入。
+// 所以我们在这里创建一个全局的 State 单例，
+// 每个入口函数内部通过 STATE.with(|state| ...) 来读写它。
 thread_local! {
     static STATE: RefCell<crate::State> = RefCell::new(Default::default());
 }

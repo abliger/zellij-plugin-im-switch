@@ -266,4 +266,19 @@ mod tests {
         assert_eq!(file_name(&PaneId::Terminal(42)), "t42");
         assert_eq!(file_name(&PaneId::Plugin(7)), "p7");
     }
+
+    #[test]
+    fn test_chrono_format() {
+        let dt = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "1970-01-01 00:00:00"
+        );
+
+        let dt = chrono::DateTime::from_timestamp(1_609_459_200, 0).unwrap();
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2021-01-01 00:00:00"
+        );
+    }
 }
