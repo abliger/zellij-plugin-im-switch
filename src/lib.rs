@@ -5,7 +5,7 @@ use zellij_tile::prelude::*;
 
 mod shim;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default)]
 pub struct State {
@@ -22,6 +22,10 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace("'", "'\\''"))
 }
 
 fn clear_old_state(dir: &str) {
@@ -100,16 +104,16 @@ impl State {
 
         match old_id {
             Some(old) => {
+                let im = shell_quote(&self.im_select);
+                let dir = shell_quote(&self.state_dir);
                 let script = format!(
-                    "mkdir -p '{dir}'; \
+                    "mkdir -p {dir}; \
                      OLD=$({im}); \
-                     printf '%s' \"$OLD\" > '{dir}/'\"$1\".ime; \
-                     if [ -f '{dir}/'\"$2\".ime ]; then \
-                         NEW=$(cat '{dir}/'\"$2\".ime); \
+                     printf '%s' \"$OLD\" > {dir}/\"$1\".ime; \
+                     if [ -f {dir}/\"$2\".ime ]; then \
+                         NEW=$(cat {dir}/\"$2\".ime); \
                          [ \"$OLD\" != \"$NEW\" ] && {im} \"$NEW\"; \
                      fi",
-                    im = self.im_select,
-                    dir = self.state_dir,
                 );
                 run_command(
                     &["sh", "-c", &script, "--", &file_name(&old), &file_name(&new_id)],
@@ -117,13 +121,13 @@ impl State {
                 );
             }
             None => {
+                let im = shell_quote(&self.im_select);
+                let dir = shell_quote(&self.state_dir);
                 let script = format!(
-                    "mkdir -p '{dir}'; \
-                     if [ -f '{dir}/'\"$1\".ime ]; then \
-                         {im} \"$(cat '{dir}/'\"$1\".ime)\"; \
+                    "mkdir -p {dir}; \
+                     if [ -f {dir}/\"$1\".ime ]; then \
+                         {im} \"$(cat {dir}/\"$1\".ime)\"; \
                      fi",
-                    im = self.im_select,
-                    dir = self.state_dir,
                 );
                 run_command(
                     &["sh", "-c", &script, "--", &file_name(&new_id)],
