@@ -37,35 +37,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace("'", "'\\''"))
 }
 
-/// 将 Unix 时间戳秒数转换为 (年, 月, 日)。
-/// 手动实现是因为 WASM 环境无法使用 chrono。
-fn epoch_to_ymd(secs: u64) -> (u64, u64, u64) {
-    let mut days = secs / 86_400;
-    let mut year = 1970u64;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let d = if leap { 366 } else { 365 };
-        if days < d {
-            break;
-        }
-        days -= d;
-        year += 1;
-    }
-    static MONTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let mut month = 1u64;
-    for &dim in &MONTHS[..11] {
-        let d = if month == 2 && leap { 29 } else { dim };
-        if days < d {
-            break;
-        }
-        days -= d;
-        month += 1;
-    }
-    (year, month, days + 1)
-}
-
 /// 清理上一次 Zellij 会话遗留的 .ime 文件。
 /// 否则对一个已不存在的 pane 恢复 IME 时，
 /// 会使用几小时甚至几天前保存的值。
@@ -87,8 +58,6 @@ impl State {
     /// 向 state_dir/debug.log 追加一条带时间戳的日志。
     /// 用于在生产环境中排查 im-select 执行失败的问题。
     fn log(&self, msg: &str) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let log_path = format!("{}/debug.log", self.state_dir);
         let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
             Ok(f) => f,
@@ -98,21 +67,7 @@ impl State {
             }
         };
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = now.as_secs();
-        let (y, m, d) = epoch_to_ymd(secs);
-        let ts = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            y,
-            m,
-            d,
-            (secs / 3600) % 24,
-            (secs / 60) % 60,
-            secs % 60
-        );
-
+        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
         if let Err(e) = writeln!(file, "[{}] {}", ts, msg) {
             eprintln!("log: failed to write: {}", e);
         }
@@ -304,17 +259,6 @@ mod tests {
         assert_eq!(shell_quote("safe"), "'safe'");
         assert_eq!(shell_quote("it\'s"), "'it'\\''s'");
         assert_eq!(shell_quote("a'b'c"), "'a'\\''b'\\''c'");
-    }
-
-    #[test]
-    fn test_epoch_to_ymd() {
-        assert_eq!(epoch_to_ymd(0), (1970, 1, 1));
-        assert_eq!(epoch_to_ymd(86_400), (1970, 1, 2));
-        assert_eq!(epoch_to_ymd(31_536_000), (1971, 1, 1));
-        assert_eq!(epoch_to_ymd(1_577_836_800), (2020, 1, 1));
-        assert_eq!(epoch_to_ymd(1_609_459_200), (2021, 1, 1));
-        // 闰年 2020-02-29
-        assert_eq!(epoch_to_ymd(1_582_995_600), (2020, 2, 29));
     }
 
     #[test]
