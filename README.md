@@ -47,9 +47,11 @@ cp target/wasm32-wasip1/release/zellij_ime_per_pane.wasm ~/.config/zellij/plugin
 
 ```kdl
 plugins {
-    ime-per-pane location="file:~/.config/zellij/plugins/zellij_ime_per_pane.wasm"
+    ime-per-pane location="file:/home/username/.config/zellij/plugins/zellij_ime_per_pane.wasm"
 }
 ```
+
+> 注意：Zellij 的 KDL 配置不会自动展开 `~`，请使用绝对路径。
 
 ### 自定义配置
 
