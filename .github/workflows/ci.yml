@@ -25,7 +25,7 @@ jobs:
           target: wasm32-wasip1
 
       - name: Build project
-        run: cargo build --target wasm32-wasip1
+        run: cargo build --target wasm32-wasip1 --locked
 
       - name: Check formatting
         run: cargo fmt -- --check

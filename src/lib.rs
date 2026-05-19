@@ -17,9 +17,13 @@ pub struct State {
     state_dir: String,
 }
 
-/// 配置值中可能包含 "~/"，而 sh 不会自动展开它。
+/// 配置值中可能包含 "~"，而 sh 不会自动展开它。
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{}/{}", home, rest);
         }
@@ -156,7 +160,8 @@ impl State {
                 let im = shell_quote(&self.im_select);
                 let dir = shell_quote(&self.state_dir);
                 let script = format!(
-                    "mkdir -p {dir}; \
+                    "set -e; \
+                     mkdir -p {dir}; \
                      OLD=$({im}); \
                      printf '%s' \"$OLD\" > {dir}/\"$1\".ime; \
                      if [ -f {dir}/\"$2\".ime ]; then \
@@ -180,7 +185,8 @@ impl State {
                 let im = shell_quote(&self.im_select);
                 let dir = shell_quote(&self.state_dir);
                 let script = format!(
-                    "mkdir -p {dir}; \
+                    "set -e; \
+                     mkdir -p {dir}; \
                      if [ -f {dir}/\"$1\".ime ]; then \
                          {im} \"$(cat {dir}/\"$1\".ime)\"; \
                      fi",
@@ -287,6 +293,7 @@ mod tests {
     #[test]
     fn test_expand_tilde() {
         std::env::set_var("HOME", "/home/user");
+        assert_eq!(expand_tilde("~"), "/home/user");
         assert_eq!(expand_tilde("~/foo"), "/home/user/foo");
         assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
         assert_eq!(expand_tilde("relative"), "relative");
