@@ -7,6 +7,8 @@ mod shim;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 插件状态。Zellij 不会向入口点传递持久实例，
+/// 因此实际实例存放在 shim.rs 的 thread_local 中。
 #[derive(Default)]
 pub struct State {
     active_tab: Option<usize>,
@@ -15,6 +17,7 @@ pub struct State {
     state_dir: String,
 }
 
+/// 配置值中可能包含 "~/"，而 sh 不会自动展开它。
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -24,10 +27,14 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// 对字符串做 shell 引号转义，使其可以安全地插入到 sh -c 脚本中。
+/// 防止 im_select 或 state_dir 包含特殊字符时引发注入。
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace("'", "'\\''"))
 }
 
+/// 将 Unix 时间戳秒数转换为 (年, 月, 日)。
+/// 手动实现是因为 WASM 环境无法使用 chrono。
 fn epoch_to_ymd(secs: u64) -> (u64, u64, u64) {
     let mut days = secs / 86_400;
     let mut year = 1970u64;
@@ -56,6 +63,9 @@ fn epoch_to_ymd(secs: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
+/// 清理上一次 Zellij 会话遗留的 .ime 文件。
+/// 否则对一个已不存在的 pane 恢复 IME 时，
+/// 会使用几小时甚至几天前保存的值。
 fn clear_old_state(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -71,6 +81,8 @@ fn clear_old_state(dir: &str) {
 }
 
 impl State {
+    /// 向 state_dir/debug.log 追加一条带时间戳的日志。
+    /// 用于在生产环境中排查 im-select 执行失败的问题。
     fn log(&self, msg: &str) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -103,6 +115,8 @@ impl State {
         }
     }
 
+    /// 首次 PaneUpdate 时 active_tab 可能还是 None，
+    /// 因为 TabUpdate 事件可能还没到达。此时回退到扫描 manifest。
     fn resolve_tab_from_manifest(&mut self, manifest: &PaneManifest) {
         if self.active_tab.is_some() {
             return;
@@ -115,6 +129,8 @@ impl State {
         }
     }
 
+    /// 查找焦点 pane 时优先选择浮动 pane，
+    /// 因为浮动 pane 可以覆盖在普通 pane 上方并窃取焦点。
     fn focused_pane_id(&self, manifest: &PaneManifest) -> Option<PaneId> {
         let tab = self.active_tab?;
         let panes = manifest.panes.get(&tab)?;
@@ -128,6 +144,8 @@ impl State {
         Some(PaneId::Terminal(p.id))
     }
 
+    /// 先保存旧 pane 的当前输入法，再恢复新 pane 之前保存的输入法。
+    /// 第一次聚焦某个 pane 时没有旧 pane，只做恢复。
     fn switch_ime(&self, old_id: Option<PaneId>, new_id: PaneId) {
         self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
 
@@ -192,6 +210,14 @@ impl ZellijPlugin for State {
         }
         clear_old_state(&self.state_dir);
 
+        let log_path = format!("{}/debug.log", self.state_dir);
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > 1_048_576 {
+                let _ = std::fs::remove_file(&log_path);
+            }
+        }
+
+        // 必须先请求权限再订阅事件，否则 Zellij 会拒绝投递这些事件。
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
@@ -202,6 +228,12 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
         ]);
         self.log("plugin loaded");
+    }
+
+    fn render(&mut self, _rows: usize, _cols: usize) {}
+
+    fn pipe(&mut self, _message: PipeMessage) -> bool {
+        false
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -225,6 +257,7 @@ impl ZellijPlugin for State {
                 self.focused_pane = Some(new_id);
                 self.switch_ime(old_id, new_id);
             }
+            // im_select 通过 run_command 异步执行，在这里检查退出码。
             Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
                 if context.contains_key("im_switch") && exit_code != Some(0) {
                     self.log("im-select command failed");
@@ -236,6 +269,7 @@ impl ZellijPlugin for State {
     }
 }
 
+/// 将 PaneId 编码为 "t{数字}" 或 "p{数字}"，用作 .ime 文件名。
 fn file_name(id: &PaneId) -> String {
     match id {
         PaneId::Terminal(n) => format!("t{}", n),
