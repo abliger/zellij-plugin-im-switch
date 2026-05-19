@@ -49,8 +49,7 @@ fn epoch_to_ymd(secs: u64) -> (u64, u64, u64) {
         year += 1;
     }
     static MONTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let leap =
-        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let mut month = 1u64;
     for &dim in &MONTHS[..11] {
         let d = if month == 2 && leap { 29 } else { dim };
@@ -166,7 +165,14 @@ impl State {
                      fi",
                 );
                 run_command(
-                    &["sh", "-c", &script, "--", &file_name(&old), &file_name(&new_id)],
+                    &[
+                        "sh",
+                        "-c",
+                        &script,
+                        "--",
+                        &file_name(&old),
+                        &file_name(&new_id),
+                    ],
                     ctx,
                 );
             }
@@ -179,10 +185,7 @@ impl State {
                          {im} \"$(cat {dir}/\"$1\".ime)\"; \
                      fi",
                 );
-                run_command(
-                    &["sh", "-c", &script, "--", &file_name(&new_id)],
-                    ctx,
-                );
+                run_command(&["sh", "-c", &script, "--", &file_name(&new_id)], ctx);
             }
         }
     }
@@ -274,5 +277,42 @@ fn file_name(id: &PaneId) -> String {
     match id {
         PaneId::Terminal(n) => format!("t{}", n),
         PaneId::Plugin(n) => format!("p{}", n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_tilde() {
+        std::env::set_var("HOME", "/home/user");
+        assert_eq!(expand_tilde("~/foo"), "/home/user/foo");
+        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
+        assert_eq!(expand_tilde("relative"), "relative");
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote("safe"), "'safe'");
+        assert_eq!(shell_quote("it\'s"), "'it'\\''s'");
+        assert_eq!(shell_quote("a'b'c"), "'a'\\''b'\\''c'");
+    }
+
+    #[test]
+    fn test_epoch_to_ymd() {
+        assert_eq!(epoch_to_ymd(0), (1970, 1, 1));
+        assert_eq!(epoch_to_ymd(86_400), (1970, 1, 2));
+        assert_eq!(epoch_to_ymd(31_536_000), (1971, 1, 1));
+        assert_eq!(epoch_to_ymd(1_577_836_800), (2020, 1, 1));
+        assert_eq!(epoch_to_ymd(1_609_459_200), (2021, 1, 1));
+        // 闰年 2020-02-29
+        assert_eq!(epoch_to_ymd(1_582_995_600), (2020, 2, 29));
+    }
+
+    #[test]
+    fn test_file_name() {
+        assert_eq!(file_name(&PaneId::Terminal(42)), "t42");
+        assert_eq!(file_name(&PaneId::Plugin(7)), "p7");
     }
 }

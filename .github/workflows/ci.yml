@@ -34,7 +34,7 @@ jobs:
         run: cargo clippy --target wasm32-wasip1 -- -D warnings
 
       - name: Run tests
-        run: cargo test --target wasm32-wasip1
+        run: cargo test
 
       - name: Build release (locked)
         run: cargo build --release --target wasm32-wasip1 --locked
