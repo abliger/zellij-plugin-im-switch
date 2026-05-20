@@ -15,6 +15,8 @@ pub struct State {
     im_select: String,
     state_dir: String,
     session_name: Option<String>,
+    /// 上一次 SessionUpdate 中的 connected_clients，用于检测 attach/detach
+    last_connected_clients: Option<usize>,
 }
 
 impl State {
@@ -38,12 +40,18 @@ impl State {
     }
 
     /// 设置 session 名称。
+    /// 如果此前已经收到了 PaneUpdate 并记录了 focused_pane，
+    /// 立即恢复该 pane 的输入法（因为 PaneUpdate 阶段 session_name 尚未解析，
+    /// 所以当时跳过了 switch_ime）。
     fn set_session_name(&mut self, name: &str) {
         if self.session_name.as_deref() == Some(name) {
             return;
         }
         self.session_name = Some(name.to_string());
         eprintln!("session name resolved: {}", name);
+        if let Some(pane) = self.focused_pane {
+            self.switch_ime(None, pane);
+        }
     }
 
     /// 清理已不存在 session 的状态目录。
@@ -234,10 +242,28 @@ impl ZellijPlugin for State {
                 self.handle_mode_update(&mode_info);
             }
             Event::SessionUpdate(sessions, _) => {
-                // SessionUpdate 到达时也可作为备选来源
-                if self.session_name.is_none() {
-                    if let Some(session) = sessions.iter().find(|s| s.is_current_session) {
+                if let Some(session) = sessions.iter().find(|s| s.is_current_session) {
+                    let prev = self.last_connected_clients;
+                    let curr = session.connected_clients;
+                    self.last_connected_clients = Some(curr);
+
+                    // 首次获取 session_name
+                    if self.session_name.is_none() {
                         self.set_session_name(&session.name);
+                    }
+
+                    // 客户端从有到无：detach 了，保存当前输入法
+                    if prev.map_or(false, |n| n > 0) && curr == 0 {
+                        self.save_current_ime();
+                    }
+
+                    // 客户端从无到有：attach 了，恢复当前 pane 的输入法
+                    if prev == Some(0) && curr > 0 {
+                        if let Some(pane) = self.focused_pane {
+                            if self.session_name.is_some() {
+                                self.switch_ime(None, pane);
+                            }
+                        }
                     }
                 }
                 self.clear_dead_session_states(&sessions);
