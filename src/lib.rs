@@ -9,12 +9,24 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 插件状态。Zellij 不会向入口点传递持久实例，
 /// 因此实际实例存放在 shim.rs 的 thread_local 中。
-#[derive(Default)]
 pub struct State {
     active_tab: Option<usize>,
     focused_pane: Option<PaneId>,
     im_select: String,
     state_dir: String,
+    session_name: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            active_tab: None,
+            focused_pane: None,
+            im_select: String::new(),
+            state_dir: String::new(),
+            session_name: None,
+        }
+    }
 }
 
 /// 配置值中可能包含 "~"，而 sh 不会自动展开它。
@@ -40,7 +52,7 @@ fn shell_quote(s: &str) -> String {
 /// 清理上一次 Zellij 会话遗留的 .ime 文件。
 /// 否则对一个已不存在的 pane 恢复 IME 时，
 /// 会使用几小时甚至几天前保存的值。
-fn clear_old_state(dir: &str) {
+fn clear_old_session_state(dir: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -48,7 +60,36 @@ fn clear_old_state(dir: &str) {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("ime") {
             if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("clear_old_state: failed to remove {:?}: {}", path, e);
+                eprintln!("clear_old_session_state: failed to remove {:?}: {}", path, e);
+            }
+        }
+    }
+}
+
+/// 清理已不存在 session 的状态目录。
+/// 当用户执行 delete-session 后，对应的 .ime 文件不会被自动删除，
+/// 这里在插件加载时做一次清理。
+fn clear_dead_session_states(state_dir: &str, live_sessions: &[SessionInfo]) {
+    let live_names: std::collections::HashSet<&str> =
+        live_sessions.iter().map(|s| s.name.as_str()).collect();
+
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !live_names.contains(name) {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                eprintln!(
+                    "clear_dead_session_states: failed to remove {:?}: {}",
+                    path, e
+                );
             }
         }
     }
@@ -71,6 +112,49 @@ impl State {
         if let Err(e) = writeln!(file, "[{}] {}", ts, msg) {
             eprintln!("log: failed to write: {}", e);
         }
+    }
+
+    /// 获取当前 session 的状态文件目录。
+    fn session_state_dir(&self) -> Option<String> {
+        self.session_name
+            .as_ref()
+            .map(|n| format!("{}/{}", self.state_dir, n))
+    }
+
+    /// 解析并设置当前 session 名称，初始化 session 状态目录。
+    fn resolve_session_name(&mut self) {
+        // 优先从环境变量获取（最快，不需要额外权限）
+        let env_vars = get_session_environment_variables();
+        if let Some(name) = env_vars.get("ZELLIJ_SESSION_NAME") {
+            if !name.is_empty() {
+                self.set_session_name(name);
+                return;
+            }
+        }
+
+        // 备选：从 session list 获取
+        if let Ok(list) = get_session_list() {
+            if let Some(session) = list.live_sessions.iter().find(|s| s.is_current_session) {
+                self.set_session_name(&session.name);
+            }
+        }
+    }
+
+    /// 设置 session 名称并初始化对应的目录。
+    fn set_session_name(&mut self, name: &str) {
+        if self.session_name.as_deref() == Some(name) {
+            return;
+        }
+        self.session_name = Some(name.to_string());
+        let dir = format!("{}/{}", self.state_dir, name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!(
+                "set_session_name: failed to create session dir {}: {}",
+                dir, e
+            );
+        }
+        clear_old_session_state(&dir);
+        self.log(&format!("session name resolved: {}", name));
     }
 
     /// 首次 PaneUpdate 时 active_tab 可能还是 None，
@@ -107,13 +191,19 @@ impl State {
     fn switch_ime(&self, old_id: Option<PaneId>, new_id: PaneId) {
         self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
 
+        let Some(dir) = self.session_state_dir() else {
+            self.log("switch_ime: no session name");
+            return;
+        };
+
         let mut ctx = BTreeMap::new();
         ctx.insert("im_switch".to_string(), "1".to_string());
 
+        let im = shell_quote(&self.im_select);
+        let dir = shell_quote(&dir);
+
         match old_id {
             Some(old) => {
-                let im = shell_quote(&self.im_select);
-                let dir = shell_quote(&self.state_dir);
                 let script = format!(
                     "set -e; \
                      mkdir -p {dir}; \
@@ -137,8 +227,6 @@ impl State {
                 );
             }
             None => {
-                let im = shell_quote(&self.im_select);
-                let dir = shell_quote(&self.state_dir);
                 let script = format!(
                     "set -e; \
                      mkdir -p {dir}; \
@@ -172,7 +260,6 @@ impl ZellijPlugin for State {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
             eprintln!("load: failed to create state dir {}: {}", self.state_dir, e);
         }
-        clear_old_state(&self.state_dir);
 
         let log_path = format!("{}/debug.log", self.state_dir);
         if let Ok(meta) = std::fs::metadata(&log_path) {
@@ -185,12 +272,18 @@ impl ZellijPlugin for State {
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
+            PermissionType::ReadSessionEnvironmentVariables,
         ]);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::RunCommandResult,
+            EventType::SessionUpdate,
         ]);
+
+        // 尝试同步获取 session 名称。如果权限尚未批准，会在 PermissionRequestResult
+        // 或 SessionUpdate 事件中再次尝试。
+        self.resolve_session_name();
         self.log("plugin loaded");
     }
 
@@ -202,7 +295,23 @@ impl ZellijPlugin for State {
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::PermissionRequestResult(_) => {}
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                // 权限批准后，再次尝试获取 session 名称
+                if self.session_name.is_none() {
+                    self.resolve_session_name();
+                }
+            }
+            Event::PermissionRequestResult(PermissionStatus::Denied) => {}
+            Event::SessionUpdate(sessions, _) => {
+                // 从 SessionUpdate 中提取当前 session 名称
+                if self.session_name.is_none() {
+                    if let Some(session) = sessions.iter().find(|s| s.is_current_session) {
+                        self.set_session_name(&session.name);
+                        // 清理已不存在 session 的状态目录
+                        clear_dead_session_states(&self.state_dir, &sessions);
+                    }
+                }
+            }
             Event::TabUpdate(tabs) => {
                 if let Some(t) = tabs.iter().find(|t| t.active) {
                     self.active_tab = Some(t.position);
@@ -215,6 +324,11 @@ impl ZellijPlugin for State {
                     None => return false,
                 };
                 if self.focused_pane == Some(new_id) {
+                    return false;
+                }
+                // session 名称尚未解析，延迟输入法切换
+                if self.session_name.is_none() {
+                    self.focused_pane = Some(new_id);
                     return false;
                 }
                 let old_id = self.focused_pane;
