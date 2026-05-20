@@ -77,6 +77,11 @@ impl State {
     /// 当用户执行 delete-session 后，对应的 .ime 文件不会被自动删除，
     /// 这里在收到 SessionUpdate 时做一次清理。
     fn clear_dead_session_states(&self, live_sessions: &[SessionInfo]) {
+        // 空列表保护：SessionUpdate 在启动初期或权限被拒时可能送达空列表，
+        // 此时若执行清理脚本，下面的 for 循环不进入，所有目录都会被 rm -rf。
+        if live_sessions.is_empty() {
+            return;
+        }
         let state_dir = util::shell_quote(&self.state_dir);
         // 白名单通过位置参数传入，避免 shell 解析风险。
         let script = format!(
