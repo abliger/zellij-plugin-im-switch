@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use zellij_tile::prelude::*;
 
 mod shim;
+mod util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -29,91 +28,7 @@ impl Default for State {
     }
 }
 
-/// 配置值中可能包含 "~"，而 sh 不会自动展开它。
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return home;
-        }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}/{}", home, rest);
-        }
-    }
-    path.to_string()
-}
-
-/// 对字符串做 shell 引号转义，使其可以安全地插入到 sh -c 脚本中。
-/// 防止 im_select 或 state_dir 包含特殊字符时引发注入。
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace("'", "'\\''"))
-}
-
-/// 清理上一次 Zellij 会话遗留的 .ime 文件。
-/// 否则对一个已不存在的 pane 恢复 IME 时，
-/// 会使用几小时甚至几天前保存的值。
-fn clear_old_session_state(dir: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("ime") {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("clear_old_session_state: failed to remove {:?}: {}", path, e);
-            }
-        }
-    }
-}
-
-/// 清理已不存在 session 的状态目录。
-/// 当用户执行 delete-session 后，对应的 .ime 文件不会被自动删除，
-/// 这里在插件加载时做一次清理。
-fn clear_dead_session_states(state_dir: &str, live_sessions: &[SessionInfo]) {
-    let live_names: std::collections::HashSet<&str> =
-        live_sessions.iter().map(|s| s.name.as_str()).collect();
-
-    let Ok(entries) = std::fs::read_dir(state_dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !live_names.contains(name) {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!(
-                    "clear_dead_session_states: failed to remove {:?}: {}",
-                    path, e
-                );
-            }
-        }
-    }
-}
-
 impl State {
-    /// 向 state_dir/debug.log 追加一条带时间戳的日志。
-    /// 用于在生产环境中排查 im-select 执行失败的问题。
-    fn log(&self, msg: &str) {
-        let log_path = format!("{}/debug.log", self.state_dir);
-        let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("log: failed to open {}: {}", log_path, e);
-                return;
-            }
-        };
-
-        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
-        if let Err(e) = writeln!(file, "[{}] {}", ts, msg) {
-            eprintln!("log: failed to write: {}", e);
-        }
-    }
-
     /// 获取当前 session 的状态文件目录。
     fn session_state_dir(&self) -> Option<String> {
         self.session_name
@@ -133,21 +48,57 @@ impl State {
         }
     }
 
-    /// 设置 session 名称并初始化对应的目录。
+    /// 设置 session 名称。状态目录的创建和清理由 switch_ime 启动的 sh 脚本完成，
+    /// 因为 wasm 沙盒不允许插件直接访问 ~/.cache。
     fn set_session_name(&mut self, name: &str) {
         if self.session_name.as_deref() == Some(name) {
             return;
         }
         self.session_name = Some(name.to_string());
-        let dir = format!("{}/{}", self.state_dir, name);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!(
-                "set_session_name: failed to create session dir {}: {}",
-                dir, e
-            );
+        eprintln!("session name resolved: {}", name);
+        self.clear_old_session_state();
+    }
+
+    /// 清理上一次 Zellij 会话遗留的 .ime 文件。
+    /// 否则对一个已不存在的 pane 恢复 IME 时，
+    /// 会使用几小时甚至几天前保存的值。
+    fn clear_old_session_state(&self) {
+        let Some(dir) = self.session_state_dir() else {
+            return;
+        };
+        let dir = util::shell_quote(&dir);
+        let script = format!("mkdir -p {dir}; rm -f {dir}/*.ime");
+        let mut ctx = BTreeMap::new();
+        ctx.insert("im_cleanup".to_string(), "1".to_string());
+        run_command(&["sh", "-c", &script], ctx);
+    }
+
+    /// 清理已不存在 session 的状态目录。
+    /// 当用户执行 delete-session 后，对应的 .ime 文件不会被自动删除，
+    /// 这里在收到 SessionUpdate 时做一次清理。
+    fn clear_dead_session_states(&self, live_sessions: &[SessionInfo]) {
+        let state_dir = util::shell_quote(&self.state_dir);
+        // 白名单通过位置参数传入，避免 shell 解析风险。
+        let script = format!(
+            "state_dir={state_dir}; \
+             [ -d \"$state_dir\" ] || exit 0; \
+             for d in \"$state_dir\"/*; do \
+                 [ -d \"$d\" ] || continue; \
+                 name=$(basename \"$d\"); \
+                 keep=0; \
+                 for live in \"$@\"; do \
+                     [ \"$name\" = \"$live\" ] && keep=1 && break; \
+                 done; \
+                 [ \"$keep\" = 0 ] && rm -rf \"$d\"; \
+             done"
+        );
+        let mut args: Vec<&str> = vec!["sh", "-c", &script, "--"];
+        for s in live_sessions {
+            args.push(&s.name);
         }
-        clear_old_session_state(&dir);
-        self.log(&format!("session name resolved: {}", name));
+        let mut ctx = BTreeMap::new();
+        ctx.insert("im_cleanup".to_string(), "1".to_string());
+        run_command(&args, ctx);
     }
 
     /// 首次 PaneUpdate 时 active_tab 可能还是 None，
@@ -181,19 +132,19 @@ impl State {
 
     /// 先保存旧 pane 的当前输入法，再恢复新 pane 之前保存的输入法。
     /// 第一次聚焦某个 pane 时没有旧 pane，只做恢复。
-    fn switch_ime(&self, old_id: Option<PaneId>, new_id: PaneId) {
-        self.log(&format!("pane switch: old={:?}, new={:?}", old_id, new_id));
+    fn switch_ime(&mut self, old_id: Option<PaneId>, new_id: PaneId) {
+        eprintln!("pane switch: old={:?}, new={:?}", old_id, new_id);
 
         let Some(dir) = self.session_state_dir() else {
-            self.log("switch_ime: no session name");
+            eprintln!("switch_ime: no session name");
             return;
         };
 
         let mut ctx = BTreeMap::new();
         ctx.insert("im_switch".to_string(), "1".to_string());
 
-        let im = shell_quote(&self.im_select);
-        let dir = shell_quote(&dir);
+        let im = util::shell_quote(&self.im_select);
+        let dir = util::shell_quote(&dir);
 
         match old_id {
             Some(old) => {
@@ -213,8 +164,8 @@ impl State {
                         "-c",
                         &script,
                         "--",
-                        &file_name(&old),
-                        &file_name(&new_id),
+                        &util::file_name(&old),
+                        &util::file_name(&new_id),
                     ],
                     ctx,
                 );
@@ -227,7 +178,7 @@ impl State {
                          {im} \"$(cat {dir}/\"$1\".ime)\"; \
                      fi",
                 );
-                run_command(&["sh", "-c", &script, "--", &file_name(&new_id)], ctx);
+                run_command(&["sh", "-c", &script, "--", &util::file_name(&new_id)], ctx);
             }
         }
     }
@@ -237,29 +188,18 @@ impl ZellijPlugin for State {
     fn load(&mut self, config: BTreeMap<String, String>) {
         let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
 
-        self.im_select = expand_tilde(
+        self.im_select = util::expand_tilde(
             &config
                 .get("im_select")
                 .cloned()
                 .unwrap_or_else(|| format!("{}/.local/bin/im-select", home)),
         );
-        self.state_dir = expand_tilde(
+        self.state_dir = util::expand_tilde(
             &config
                 .get("state_dir")
                 .cloned()
                 .unwrap_or_else(|| format!("{}/.cache/zellij-ime", home)),
         );
-
-        if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
-            eprintln!("load: failed to create state dir {}: {}", self.state_dir, e);
-        }
-
-        let log_path = format!("{}/debug.log", self.state_dir);
-        if let Ok(meta) = std::fs::metadata(&log_path) {
-            if meta.len() > 1_048_576 {
-                let _ = std::fs::remove_file(&log_path);
-            }
-        }
 
         // 必须先请求权限再订阅事件，否则 Zellij 会拒绝投递这些事件。
         request_permission(&[
@@ -273,7 +213,7 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::SessionUpdate,
         ]);
-        self.log("plugin loaded");
+        eprintln!("plugin loaded");
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {}
@@ -294,8 +234,7 @@ impl ZellijPlugin for State {
                         self.set_session_name(&session.name);
                     }
                 }
-                // 清理已不存在 session 的状态目录
-                clear_dead_session_states(&self.state_dir, &sessions);
+                self.clear_dead_session_states(&sessions);
             }
             Event::TabUpdate(tabs) => {
                 if let Some(t) = tabs.iter().find(|t| t.active) {
@@ -323,61 +262,11 @@ impl ZellijPlugin for State {
             // im_select 通过 run_command 异步执行，在这里检查退出码。
             Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
                 if context.contains_key("im_switch") && exit_code != Some(0) {
-                    self.log("im-select command failed");
+                    eprintln!("im-select command failed");
                 }
             }
             _ => {}
         }
         false
-    }
-}
-
-/// 将 PaneId 编码为 "t{数字}" 或 "p{数字}"，用作 .ime 文件名。
-fn file_name(id: &PaneId) -> String {
-    match id {
-        PaneId::Terminal(n) => format!("t{}", n),
-        PaneId::Plugin(n) => format!("p{}", n),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_expand_tilde() {
-        std::env::set_var("HOME", "/home/user");
-        assert_eq!(expand_tilde("~"), "/home/user");
-        assert_eq!(expand_tilde("~/foo"), "/home/user/foo");
-        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
-        assert_eq!(expand_tilde("relative"), "relative");
-    }
-
-    #[test]
-    fn test_shell_quote() {
-        assert_eq!(shell_quote("safe"), "'safe'");
-        assert_eq!(shell_quote("it\'s"), "'it'\\''s'");
-        assert_eq!(shell_quote("a'b'c"), "'a'\\''b'\\''c'");
-    }
-
-    #[test]
-    fn test_file_name() {
-        assert_eq!(file_name(&PaneId::Terminal(42)), "t42");
-        assert_eq!(file_name(&PaneId::Plugin(7)), "p7");
-    }
-
-    #[test]
-    fn test_chrono_format() {
-        let dt = chrono::DateTime::from_timestamp(0, 0).unwrap();
-        assert_eq!(
-            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            "1970-01-01 00:00:00"
-        );
-
-        let dt = chrono::DateTime::from_timestamp(1_609_459_200, 0).unwrap();
-        assert_eq!(
-            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            "2021-01-01 00:00:00"
-        );
     }
 }
