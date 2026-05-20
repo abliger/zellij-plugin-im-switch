@@ -8,24 +8,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 插件状态。Zellij 不会向入口点传递持久实例，
 /// 因此实际实例存放在 shim.rs 的 thread_local 中。
+#[derive(Default)]
 pub struct State {
     active_tab: Option<usize>,
     focused_pane: Option<PaneId>,
     im_select: String,
     state_dir: String,
     session_name: Option<String>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            active_tab: None,
-            focused_pane: None,
-            im_select: String::new(),
-            state_dir: String::new(),
-            session_name: None,
-        }
-    }
 }
 
 impl State {
@@ -48,29 +37,13 @@ impl State {
         }
     }
 
-    /// 设置 session 名称。状态目录的创建和清理由 switch_ime 启动的 sh 脚本完成，
-    /// 因为 wasm 沙盒不允许插件直接访问 ~/.cache。
+    /// 设置 session 名称。
     fn set_session_name(&mut self, name: &str) {
         if self.session_name.as_deref() == Some(name) {
             return;
         }
         self.session_name = Some(name.to_string());
         eprintln!("session name resolved: {}", name);
-        self.clear_old_session_state();
-    }
-
-    /// 清理上一次 Zellij 会话遗留的 .ime 文件。
-    /// 否则对一个已不存在的 pane 恢复 IME 时，
-    /// 会使用几小时甚至几天前保存的值。
-    fn clear_old_session_state(&self) {
-        let Some(dir) = self.session_state_dir() else {
-            return;
-        };
-        let dir = util::shell_quote(&dir);
-        let script = format!("mkdir -p {dir}; rm -f {dir}/*.ime");
-        let mut ctx = BTreeMap::new();
-        ctx.insert("im_cleanup".to_string(), "1".to_string());
-        run_command(&["sh", "-c", &script], ctx);
     }
 
     /// 清理已不存在 session 的状态目录。
@@ -135,6 +108,33 @@ impl State {
         Some(PaneId::Terminal(p.id))
     }
 
+    /// 保存当前焦点 pane 的输入法到 .ime 文件。
+    /// 用于 BeforeClose 等需要保存当前状态但不切换 pane 的场景。
+    fn save_current_ime(&self) {
+        let Some(dir) = self.session_state_dir() else {
+            return;
+        };
+        let Some(pane_id) = self.focused_pane else {
+            return;
+        };
+
+        let mut ctx = BTreeMap::new();
+        ctx.insert("im_save".to_string(), "1".to_string());
+
+        let im = util::shell_quote(&self.im_select);
+        let dir = util::shell_quote(&dir);
+        let script = format!(
+            "set -e; \
+             mkdir -p {dir}; \
+             OLD=$({im}); \
+             printf '%s' \"$OLD\" > {dir}/\"$1\".ime",
+        );
+        run_command(
+            &["sh", "-c", &script, "--", &util::file_name(&pane_id)],
+            ctx,
+        );
+    }
+
     /// 先保存旧 pane 的当前输入法，再恢复新 pane 之前保存的输入法。
     /// 第一次聚焦某个 pane 时没有旧 pane，只做恢复。
     fn switch_ime(&mut self, old_id: Option<PaneId>, new_id: PaneId) {
@@ -197,7 +197,7 @@ impl ZellijPlugin for State {
             &config
                 .get("im_select")
                 .cloned()
-                .unwrap_or_else(|| format!("{}/.local/bin/im-select", home)),
+                .unwrap_or_else(|| "im-select".to_string()),
         );
         self.state_dir = util::expand_tilde(
             &config
@@ -217,6 +217,7 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::ModeUpdate,
             EventType::SessionUpdate,
+            EventType::BeforeClose,
         ]);
         eprintln!("plugin loaded");
     }
@@ -264,9 +265,14 @@ impl ZellijPlugin for State {
                 self.focused_pane = Some(new_id);
                 self.switch_ime(old_id, new_id);
             }
+            Event::BeforeClose => {
+                self.save_current_ime();
+            }
             // im_select 通过 run_command 异步执行，在这里检查退出码。
             Event::RunCommandResult(exit_code, _stdout, _stderr, context) => {
-                if context.contains_key("im_switch") && exit_code != Some(0) {
+                if (context.contains_key("im_switch") || context.contains_key("im_save"))
+                    && exit_code != Some(0)
+                {
                     eprintln!("im-select command failed");
                 }
             }
