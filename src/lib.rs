@@ -121,21 +121,14 @@ impl State {
             .map(|n| format!("{}/{}", self.state_dir, n))
     }
 
-    /// 解析并设置当前 session 名称，初始化 session 状态目录。
-    fn resolve_session_name(&mut self) {
-        // 优先从环境变量获取（最快，不需要额外权限）
-        let env_vars = get_session_environment_variables();
-        if let Some(name) = env_vars.get("ZELLIJ_SESSION_NAME") {
+    /// 从 ModeUpdate 中提取 session 名称。
+    fn handle_mode_update(&mut self, mode_info: &ModeInfo) {
+        if self.session_name.is_some() {
+            return;
+        }
+        if let Some(name) = &mode_info.session_name {
             if !name.is_empty() {
                 self.set_session_name(name);
-                return;
-            }
-        }
-
-        // 备选：从 session list 获取
-        if let Ok(list) = get_session_list() {
-            if let Some(session) = list.live_sessions.iter().find(|s| s.is_current_session) {
-                self.set_session_name(&session.name);
             }
         }
     }
@@ -272,18 +265,14 @@ impl ZellijPlugin for State {
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
-            PermissionType::ReadSessionEnvironmentVariables,
         ]);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::RunCommandResult,
+            EventType::ModeUpdate,
             EventType::SessionUpdate,
         ]);
-
-        // 尝试同步获取 session 名称。如果权限尚未批准，会在 PermissionRequestResult
-        // 或 SessionUpdate 事件中再次尝试。
-        self.resolve_session_name();
         self.log("plugin loaded");
     }
 
@@ -295,22 +284,18 @@ impl ZellijPlugin for State {
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                // 权限批准后，再次尝试获取 session 名称
-                if self.session_name.is_none() {
-                    self.resolve_session_name();
-                }
+            Event::ModeUpdate(mode_info) => {
+                self.handle_mode_update(&mode_info);
             }
-            Event::PermissionRequestResult(PermissionStatus::Denied) => {}
             Event::SessionUpdate(sessions, _) => {
-                // 从 SessionUpdate 中提取当前 session 名称
+                // SessionUpdate 到达时也可作为备选来源
                 if self.session_name.is_none() {
                     if let Some(session) = sessions.iter().find(|s| s.is_current_session) {
                         self.set_session_name(&session.name);
-                        // 清理已不存在 session 的状态目录
-                        clear_dead_session_states(&self.state_dir, &sessions);
                     }
                 }
+                // 清理已不存在 session 的状态目录
+                clear_dead_session_states(&self.state_dir, &sessions);
             }
             Event::TabUpdate(tabs) => {
                 if let Some(t) = tabs.iter().find(|t| t.active) {
