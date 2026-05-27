@@ -68,7 +68,7 @@ plugins {
 ```kdl
 plugins {
     ime-per-pane location="file:/home/username/.config/zellij/plugins/zellij_ime_per_pane.wasm" {
-        im_select "/opt/homebrew/bin/im-select"
+        im_select "/pathto/im-select"
         state_dir "~/.cache/zellij-ime"
     }
 }
